@@ -30,6 +30,7 @@
 #include <net/genetlink.h>
 #include <net/netevent.h>
 #include <net/flow_offload.h>
+#include <net/sock.h>
 
 #include <trace/events/skb.h>
 #include <trace/events/napi.h>
@@ -46,6 +47,7 @@
  */
 static int trace_state = TRACE_OFF;
 static bool monitor_hw;
+struct net_device *interface;
 
 /* net_dm_mutex
  *
@@ -53,6 +55,8 @@ static bool monitor_hw;
  * It also guards the global 'hw_stats_list' list.
  */
 static DEFINE_MUTEX(net_dm_mutex);
+
+static DEFINE_SPINLOCK(interface_lock);
 
 struct net_dm_stats {
 	u64 dropped;
@@ -217,6 +221,7 @@ static void trace_drop_common(struct sk_buff *skb, void *location)
 	struct nlattr *nla;
 	int i;
 	struct sk_buff *dskb;
+	struct sk_buff *nskb;
 	struct per_cpu_dm_data *data;
 	unsigned long flags;
 
@@ -255,6 +260,18 @@ static void trace_drop_common(struct sk_buff *skb, void *location)
 
 out:
 	spin_unlock_irqrestore(&data->lock, flags);
+	nskb = skb_clone(skb, GFP_ATOMIC);
+	if (!nskb)
+		return;
+	spin_lock_irqsave(&interface_lock, flags);
+	if (interface && interface != nskb->dev) {
+		nskb->dev = interface;
+		spin_unlock_irqrestore(&interface_lock, flags);
+		netif_receive_skb(nskb);
+	} else {
+		consume_skb(nskb);
+		spin_unlock_irqrestore(&interface_lock, flags);
+	}
 }
 
 static void trace_kfree_skb_hit(void *ignore, struct sk_buff *skb, void *location)
@@ -1315,6 +1332,88 @@ static int net_dm_cmd_trace(struct sk_buff *skb,
 	return -EOPNOTSUPP;
 }
 
+static bool is_dummy_dev(struct net_device *dev)
+{
+	struct ethtool_drvinfo drvinfo;
+
+	if (dev->ethtool_ops && dev->ethtool_ops->get_drvinfo) {
+		memset(&drvinfo, 0, sizeof(drvinfo));
+		dev->ethtool_ops->get_drvinfo(dev, &drvinfo);
+
+		if (strcmp(drvinfo.driver, "dummy"))
+			return false;
+		return true;
+	}
+	return false;
+}
+
+static int net_dm_interface_start(struct net *net, const char *ifname)
+{
+	struct net_device *dev = dev_get_by_name(net, ifname);
+	unsigned long flags;
+	int rc = -EBUSY;
+
+	if (!dev)
+		return -ENODEV;
+
+	if (!is_dummy_dev(dev)) {
+		dev_put(dev);
+		return -EOPNOTSUPP;
+	}
+
+	spin_lock_irqsave(&interface_lock, flags);
+	if (!interface) {
+		interface = dev;
+		rc = 0;
+	}
+	dev_put(dev);
+	spin_unlock_irqrestore(&interface_lock, flags);
+	return  rc;
+
+	return 0;	
+}
+
+static int net_dm_interface_stop(struct net *net, const char *ifname)
+{
+	unsigned long flags;
+	int rc = -ENODEV;
+
+	spin_lock_irqsave(&interface_lock, flags);
+	if (interface && interface->name == ifname) {
+		dev_put(interface);
+		interface = NULL;
+		rc = 0;
+	}
+	spin_unlock_irqrestore(&interface_lock, flags);
+	return rc;
+
+	return 0;
+}
+
+static int net_dm_cmd_ifc_trace(struct sk_buff *skb, struct genl_info *info)
+{
+	struct net *net = sock_net(skb->sk);
+	char ifname[IFNAMSIZ];
+
+	if (net_dm_is_monitoring())
+		return -EBUSY;
+
+	if (!info->attrs[NET_DM_ATTR_IFNAME])
+		return -EINVAL;
+
+	memset(ifname, 0, IFNAMSIZ);
+	nla_strlcpy(ifname, info->attrs[NET_DM_ATTR_IFNAME], IFNAMSIZ - 1);
+
+	switch (info->genlhdr->cmd) {
+	case NET_DM_CMD_START_IFC:
+		return net_dm_interface_start(net, ifname);
+	case NET_DM_CMD_STOP_IFC:
+		return net_dm_interface_stop(net, ifname);
+	}
+
+	return 0;
+}
+
 static int net_dm_config_fill(struct sk_buff *msg, struct genl_info *info)
 {
 	void *hdr;
@@ -1503,6 +1602,7 @@ static int dropmon_net_event(struct notifier_block *ev_block,
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct dm_hw_stat_delta *new_stat = NULL;
 	struct dm_hw_stat_delta *tmp;
+	unsigned long flags;
 
 	switch (event) {
 	case NETDEV_REGISTER:
@@ -1529,6 +1629,12 @@ static int dropmon_net_event(struct notifier_block *ev_block,
 				}
 			}
 		}
+		spin_lock_irqsave(&interface_lock, flags);
+		if (interface && interface == dev) {
+			dev_put(interface);
+			interface = NULL;
+		}
+		spin_unlock_irqrestore(&interface_lock, flags);
 		mutex_unlock(&net_dm_mutex);
 		break;
 	}
@@ -1543,6 +1649,7 @@ static const struct nla_policy net_dm_nl_policy[NET_DM_ATTR_MAX + 1] = {
 	[NET_DM_ATTR_QUEUE_LEN] = { .type = NLA_U32 },
 	[NET_DM_ATTR_SW_DROPS]	= {. type = NLA_FLAG },
 	[NET_DM_ATTR_HW_DROPS]	= {. type = NLA_FLAG },
+	[NET_DM_ATTR_IFNAME] = {. type = NLA_STRING, .len = IFNAMSIZ },
 };
 
 static const struct genl_ops dropmon_ops[] = {
@@ -1569,6 +1676,16 @@ static const struct genl_ops dropmon_ops[] = {
 	{
 		.cmd = NET_DM_CMD_STATS_GET,
 		.doit = net_dm_cmd_stats_get,
+	},
+	{
+		.cmd = NET_DM_CMD_START_IFC,
+		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+		.doit = net_dm_cmd_ifc_trace,
+	},
+	{
+		.cmd = NET_DM_CMD_STOP_IFC,
+		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+		.doit = net_dm_cmd_ifc_trace,
 	},
 };
 
