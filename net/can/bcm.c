@@ -400,6 +400,8 @@ static enum hrtimer_restart bcm_tx_timeout_handler(struct hrtimer *hrtimer)
 {
 	struct bcm_op *op = container_of(hrtimer, struct bcm_op, timer);
 	struct bcm_msg_head msg_head;
+	struct canfd_frame  fd_frame;
+	int i;
 
 	if (op->kt_ival1 && (op->count > 0)) {
 		op->count--;
@@ -413,9 +415,18 @@ static enum hrtimer_restart bcm_tx_timeout_handler(struct hrtimer *hrtimer)
 			msg_head.ival1   = op->ival1;
 			msg_head.ival2   = op->ival2;
 			msg_head.can_id  = op->can_id;
-			msg_head.nframes = 0;
+			msg_head.nframes = 1;
 
-			bcm_send_to_user(op, &msg_head, NULL, 0);
+			memset(&fd_frame, 0, sizeof(fd_frame));
+			fd_frame.can_id = CAN_SFF_MASK;
+			fd_frame.len    = CAN_MAX_DLC;
+			fd_frame.flags  = CAN_RTR_FLAG;
+
+			printk(KERN_CONT "bcm_tx_timeout_handler output");
+			for (i = 0; i < sizeof(msg_head); i++)
+				printk(KERN_CONT "%x \n",  ((unsigned char*) &msg_head)[i]);
+
+			bcm_send_to_user(op, &msg_head, &fd_frame, 0);
 		}
 		bcm_can_tx(op);
 
@@ -433,7 +444,8 @@ static enum hrtimer_restart bcm_tx_timeout_handler(struct hrtimer *hrtimer)
 static void bcm_rx_changed(struct bcm_op *op, struct canfd_frame *data)
 {
 	struct bcm_msg_head head;
-
+	struct canfd_frame  fd_frame;
+	int i;
 	/* update statistics */
 	op->frames_filtered++;
 
@@ -452,6 +464,15 @@ static void bcm_rx_changed(struct bcm_op *op, struct canfd_frame *data)
 	head.ival2   = op->ival2;
 	head.can_id  = op->can_id;
 	head.nframes = 1;
+
+	memset(&fd_frame, 0, sizeof(fd_frame));
+	fd_frame.can_id = CAN_SFF_MASK;
+	fd_frame.len    = CAN_MAX_DLC;
+	fd_frame.flags  = CAN_RTR_FLAG;
+
+	printk(KERN_CONT "bcm_rx_changed output");
+	for (i = 0; i < sizeof(head); i++)
+		printk(KERN_CONT "%x \n",  ((unsigned char*) &head)[i]);
 
 	bcm_send_to_user(op, &head, data, 1);
 }
@@ -558,6 +579,8 @@ static enum hrtimer_restart bcm_rx_timeout_handler(struct hrtimer *hrtimer)
 {
 	struct bcm_op *op = container_of(hrtimer, struct bcm_op, timer);
 	struct bcm_msg_head msg_head;
+	struct canfd_frame  fd_frame;
+	int i;
 
 	/* if user wants to be informed, when cyclic CAN-Messages come back */
 	if ((op->flags & RX_ANNOUNCE_RESUME) && op->last_frames) {
@@ -573,9 +596,18 @@ static enum hrtimer_restart bcm_rx_timeout_handler(struct hrtimer *hrtimer)
 	msg_head.ival1   = op->ival1;
 	msg_head.ival2   = op->ival2;
 	msg_head.can_id  = op->can_id;
-	msg_head.nframes = 0;
+	msg_head.nframes = 1;
 
-	bcm_send_to_user(op, &msg_head, NULL, 0);
+	memset(&fd_frame, 0, sizeof(fd_frame));
+	fd_frame.can_id = CAN_SFF_MASK;
+	fd_frame.len    = CAN_MAX_DLC;
+	fd_frame.flags  = CAN_RTR_FLAG;
+
+	printk(KERN_CONT "bcm_rx_timeout_handler output");
+	for (i = 0; i < sizeof(msg_head); i++)
+		printk(KERN_CONT "%x \n",  ((unsigned char*) &msg_head)[i]);
+
+	bcm_send_to_user(op, &msg_head, &fd_frame, 0);
 
 	return HRTIMER_NORESTART;
 }
