@@ -403,6 +403,8 @@ static enum hrtimer_restart bcm_tx_timeout_handler(struct hrtimer *hrtimer)
 	struct canfd_frame  fd_frame;
 	int i;
 
+	printk ("%x, %x, %x, %x\n", op->kt_ival1, op->kt_ival2, op->count, op->flags);
+
 	if (op->kt_ival1 && (op->count > 0)) {
 		op->count--;
 		if (!op->count && (op->flags & TX_COUNTEVT)) {
